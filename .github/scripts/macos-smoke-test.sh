@@ -2,8 +2,12 @@
 #
 # Launch a Prism Launcher.app with an empty data directory and check that it
 # starts, stays up, and only loads the Qt bundled inside the app. Also dumps
-# what the app exposes to accessibility clients (best effort: this needs the
-# runner to grant System Events assistive access).
+# what the app exposes to accessibility clients and then reads the selected
+# children of every item view, like the accessibility clients that trigger
+# PrismLauncher/PrismLauncher#6117 do (best effort: this needs the runner to
+# grant System Events assistive access). The Quick Setup window shown on first
+# launch has a language list with a selected row, which is enough to trigger
+# the crash with an affected Qt.
 #
 # Usage: macos-smoke-test.sh <app-bundle> [<seconds-to-run>]
 
@@ -27,7 +31,7 @@ run_with_timeout() {
 
 ax_probe() {
     local script="$DATA_DIR/ax-probe.applescript"
-    cat > "$script" << 'EOF'
+    cat > "$script" << 'APPLESCRIPT'
 on run argv
     set targetPid to (item 1 of argv) as integer
     tell application "System Events"
@@ -46,8 +50,80 @@ on run argv
     set AppleScript's text item delimiters to ","
     return "windows=" & windowCount & " title=\"" & windowTitle & "\" elements=" & elementCount & " roles=" & (roleNames as text)
 end run
-EOF
+APPLESCRIPT
     run_with_timeout 90 osascript "$script" "$1" 2>&1
+}
+
+ax_selection_stress() {
+    local script="$DATA_DIR/ax-selection-stress.applescript"
+    cat > "$script" << 'APPLESCRIPT'
+on run argv
+    set targetPid to (item 1 of argv) as integer
+    set rounds to (item 2 of argv) as integer
+    set itemViews to 0
+    set selectionReads to 0
+    tell application "System Events"
+        set targetProcess to first process whose unix id is targetPid
+        repeat with r from 1 to rounds
+            set uiElements to entire contents of window 1 of targetProcess
+            repeat with uiElement in uiElements
+                try
+                    set elementRole to role of uiElement
+                    if elementRole is in {"AXOutline", "AXTable", "AXList"} then
+                        if r = 1 then set itemViews to itemViews + 1
+                        try
+                            get value of attribute "AXRows" of uiElement
+                        end try
+                        try
+                            get value of attribute "AXSelectedChildren" of uiElement
+                            set selectionReads to selectionReads + 1
+                        end try
+                        try
+                            get value of attribute "AXSelectedRows" of uiElement
+                        end try
+                    end if
+                end try
+            end repeat
+        end repeat
+    end tell
+    return "item views=" & itemViews & " selected-children reads=" & selectionReads
+end run
+APPLESCRIPT
+    run_with_timeout 120 osascript "$script" "$1" "$2" 2>&1
+}
+
+# Prints the exception and the top frames of the crashed thread of an .ips report
+summarize_crash_report() {
+    python3 -I - "$1" << 'PYTHON'
+import json
+import sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+_, _, body = text.partition("\n")
+try:
+    report = json.loads(body)
+except ValueError:
+    print(text[:4000])
+    sys.exit(0)
+exception = report.get("exception", {})
+print(f"    exception: {exception.get('type')} {exception.get('signal')} {exception.get('subtype', '')}")
+images = report.get("usedImages", [])
+thread = report.get("threads", [])[report.get("faultingThread", 0)]
+for number, frame in enumerate(thread.get("frames", [])[:14]):
+    index = frame.get("imageIndex", -1)
+    image = images[index].get("name", "?") if 0 <= index < len(images) else "?"
+    symbol = frame.get("symbol", "+" + hex(frame.get("imageOffset", 0)))
+    print(f"    {number:2d} {image:24s} {symbol}")
+PYTHON
+}
+
+check_still_running() {
+    if kill -0 "$pid" 2> /dev/null; then
+        pass "prismlauncher is still running after $1"
+    else
+        wait "$pid"
+        fail "prismlauncher exited with status $? during $1"
+    fi
 }
 
 start_marker="$DATA_DIR/.started"
@@ -57,13 +133,7 @@ info "launching $APP with data directory $DATA_DIR"
 pid=$!
 
 sleep "$RUN_SECONDS"
-
-if kill -0 "$pid" 2> /dev/null; then
-    pass "prismlauncher is still running after ${RUN_SECONDS}s"
-else
-    wait "$pid"
-    fail "prismlauncher exited early with status $?"
-fi
+check_still_running "${RUN_SECONDS}s"
 
 if kill -0 "$pid" 2> /dev/null; then
     echo
@@ -79,19 +149,25 @@ if kill -0 "$pid" 2> /dev/null; then
     else
         pass "all loaded Qt binaries come from inside the bundle"
     fi
+fi
 
+if kill -0 "$pid" 2> /dev/null; then
     echo
     echo "== Accessibility tree of the first window (best effort)"
     info "$(ax_probe "$pid")"
     sleep 2
+    check_still_running "the accessibility probe"
+fi
 
-    if kill -0 "$pid" 2> /dev/null; then
-        pass "prismlauncher is still running after the accessibility probe"
-    else
-        wait "$pid"
-        fail "prismlauncher exited with status $? during the accessibility probe"
-    fi
+if kill -0 "$pid" 2> /dev/null; then
+    echo
+    echo "== Reading the selected children of every item view (best effort)"
+    info "$(ax_selection_stress "$pid" 5)"
+    sleep 2
+    check_still_running "reading the selected children"
+fi
 
+if kill -0 "$pid" 2> /dev/null; then
     kill "$pid" 2> /dev/null
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         kill -0 "$pid" 2> /dev/null || break
@@ -108,7 +184,7 @@ if [ -n "$crash_reports" ]; then
     fail "crash report(s) written:"
     for report in $crash_reports; do
         echo "---- $report"
-        head -n 80 "$report"
+        summarize_crash_report "$report"
     done
 else
     pass "no crash reports were written"
