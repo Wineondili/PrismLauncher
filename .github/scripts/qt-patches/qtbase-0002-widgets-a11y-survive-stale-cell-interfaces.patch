@@ -1,0 +1,177 @@
+Source: https://codereview.qt-project.org/c/qt/qtbase/+/777426 (patch set 1, under review, not merged)
+
+From 730020b0d64b4dbde7877889c31c4f4f19adf67e Mon Sep 17 00:00:00 2001
+From: Maxim Chernobayev <kuzmeech@gmail.com>
+Date: Sat, 03 Oct 2026 23:39:54 -0400
+Subject: [PATCH] Widgets a11y: survive cell interfaces deleted behind the table's back
+
+QAccessibleTable keeps the interfaces of the cells it handed out in
+childToId and assumes it is the only one deleting them. That is not
+true on macOS: when the cocoa plugin drops its row/column element
+arrays (removeElementsFromCache:) it calls QAccessibleCache::deleteInterface
+for every proper cell, so the table ends up with ids that no longer
+resolve. The next RowsInserted/RowsRemoved event then dereferences a
+null interface in modelChange() (the Q_ASSERT is compiled out in
+release), and child() hands out nullptr for a perfectly valid cell
+in between. Seen as a SIGSEGV in qBittorrent's transfer list as soon
+as any accessibility client has walked the window once.
+
+Make the table tolerate this: skip stale ids when rebuilding the cache
+in modelChange(), and treat a stale id in child() as a cache miss so
+the cell is simply created again. Same for the tree and list variants.
+
+This complements the cocoa side change for QTBUG-149612 (which stops
+the synthesized elements from deleting the parent table) and keeps the
+widgets side safe regardless of what the platform plugin does with the
+cache.
+
+Task-number: QTBUG-149612
+Pick-to: 6.12 6.11 6.10 6.8
+Change-Id: Ie9f21972875973a0962e49d212a8cbc5064849d1
+---
+
+diff --git a/src/widgets/accessible/itemviews.cpp b/src/widgets/accessible/itemviews.cpp
+index e1a756b..fb3b8d4 100644
+--- a/src/widgets/accessible/itemviews.cpp
++++ b/src/widgets/accessible/itemviews.cpp
+@@ -589,8 +589,11 @@
+ 
+     const QModelIndex rootIndex = theView->rootIndex();
+     auto id = childToId.constFind(logicalIndex);
+-    if (id != childToId.constEnd())
+-        return QAccessible::accessibleInterface(id.value());
++    if (id != childToId.constEnd()) {
++        if (QAccessibleInterface *cached = QAccessible::accessibleInterface(id.value()))
++            return cached;
++        childToId.remove(logicalIndex); // stale id, recreate the child below
++    }
+ 
+     int vHeader = verticalHeader() ? 1 : 0;
+     int hHeader = horizontalHeader() ? 1 : 0;
+@@ -667,7 +670,13 @@
+         while (iter != childToId.constEnd()) {
+             QAccessible::Id id = iter.value();
+             QAccessibleInterface *iface = QAccessible::accessibleInterface(id);
+-            Q_ASSERT(iface);
++            if (!iface) {
++                // The interface was deleted behind our back, e.g. by a platform
++                // plugin releasing its native wrappers. Drop the stale id; the
++                // child gets recreated on demand.
++                ++iter;
++                continue;
++            }
+             if (event->modelChangeType() == QAccessibleTableModelChangeEvent::RowsInserted
+                 && iface->role() == QAccessible::RowHeader) {
+                 QAccessibleTableHeaderCell *cell = static_cast<QAccessibleTableHeaderCell*>(iface);
+@@ -704,7 +713,13 @@
+         while (iter != childToId.constEnd()) {
+             QAccessible::Id id = iter.value();
+             QAccessibleInterface *iface = QAccessible::accessibleInterface(id);
+-            Q_ASSERT(iface);
++            if (!iface) {
++                // The interface was deleted behind our back, e.g. by a platform
++                // plugin releasing its native wrappers. Drop the stale id; the
++                // child gets recreated on demand.
++                ++iter;
++                continue;
++            }
+             if (iface->role() == QAccessible::Cell || iface->role() == QAccessible::ListItem) {
+                 Q_ASSERT(iface->tableCellInterface());
+                 QAccessibleTableCell *cell = static_cast<QAccessibleTableCell*>(iface->tableCellInterface());
+@@ -837,8 +852,11 @@
+         return nullptr;
+ 
+     auto id = childToId.constFind(logicalIndex);
+-    if (id != childToId.constEnd())
+-        return QAccessible::accessibleInterface(id.value());
++    if (id != childToId.constEnd()) {
++        if (QAccessibleInterface *cached = QAccessible::accessibleInterface(id.value()))
++            return cached;
++        childToId.remove(logicalIndex); // stale id, recreate the child below
++    }
+ 
+     QAccessibleInterface *iface = nullptr;
+     int index = logicalIndex;
+@@ -980,8 +998,11 @@
+     }
+ 
+     const auto id = childToId.constFind(logicalIndex);
+-    if (id != childToId.constEnd())
+-        return QAccessible::accessibleInterface(id.value());
++    if (id != childToId.constEnd()) {
++        if (QAccessibleInterface *cached = QAccessible::accessibleInterface(id.value()))
++            return cached;
++        childToId.remove(logicalIndex); // stale id, recreate the child below
++    }
+ 
+     const QListView *listView = qobject_cast<const QListView*>(theView);
+     Q_ASSERT(listView);
+diff --git a/tests/auto/other/qaccessibility/tst_qaccessibility.cpp b/tests/auto/other/qaccessibility/tst_qaccessibility.cpp
+index 0d01b4c..686b01b 100644
+--- a/tests/auto/other/qaccessibility/tst_qaccessibility.cpp
++++ b/tests/auto/other/qaccessibility/tst_qaccessibility.cpp
+@@ -218,6 +218,7 @@
+     void listPositionTest();
+     void treeTest();
+     void tableTest();
++    void tableStaleChildTest();
+     void rootIndexView();
+ 
+     void uniqueIdTest();
+@@ -3795,6 +3796,56 @@
+     QTestAccessibility::clearEvents();
+ }
+ 
++void tst_QAccessibility::tableStaleChildTest()
++{
++    // A platform plugin may delete a cell interface that QAccessibleTable
++    // still has cached (QTBUG-149612). Neither a model change nor a later
++    // child() lookup must crash or return null for a valid cell then.
++    auto tvHolder = std::make_unique<QTableWidget>(3, 3);
++    auto tableView = tvHolder.get();
++    for (int i = 0; i < 9; ++i)
++        tableView->setItem(i / 3, i % 3, new QTableWidgetItem(QString::number(i)));
++    tableView->resize(600, 600);
++    tableView->show();
++    QVERIFY(QTest::qWaitForWindowExposed(tableView));
++
++    QAccessibleInterface *iface = QAccessible::queryAccessibleInterface(tableView);
++    QVERIFY(iface);
++    QCOMPARE(iface->role(), QAccessible::Table);
++
++    // populate the child cache with two cells; with headers each row has 4 logical children
++    const int cellIndex = 1 * 4 + 2;
++    QAccessibleInterface *cell = iface->child(cellIndex);
++    QVERIFY(cell);
++    QCOMPARE(cell->role(), QAccessible::Cell);
++    QAccessibleInterface *otherCell = iface->child(2 * 4 + 3);
++    QVERIFY(otherCell);
++    const QAccessible::Id staleId = QAccessible::uniqueId(cell);
++
++    // simulate the platform layer deleting the interface behind the table's back
++    QAccessible::deleteAccessibleInterface(staleId);
++    QVERIFY(!QAccessible::accessibleInterface(staleId));
++
++    // a plain lookup must recreate the cell instead of handing out null
++    QAccessibleInterface *recreated = iface->child(cellIndex);
++    QVERIFY(recreated);
++    QCOMPARE(recreated->role(), QAccessible::Cell);
++    QVERIFY(QAccessible::uniqueId(recreated) != staleId);
++    QCOMPARE(iface->indexOfChild(recreated), cellIndex);
++
++    // same for the model change paths (RowsInserted / RowsRemoved)
++    QAccessible::deleteAccessibleInterface(QAccessible::uniqueId(recreated));
++    tableView->insertRow(0);
++    QVERIFY(iface->child(2 * 4 + 2));
++    QAccessible::deleteAccessibleInterface(QAccessible::uniqueId(iface->child(2 * 4 + 2)));
++    tableView->removeRow(0);
++    QVERIFY(iface->child(cellIndex));
++    QCOMPARE(iface->child(cellIndex)->text(QAccessible::Name), QString::number(1));
++    QVERIFY(otherCell->isValid());
++
++    QTestAccessibility::clearEvents();
++}
++
+ void tst_QAccessibility::rootIndexView()
+ {
+     QStandardItemModel model;
