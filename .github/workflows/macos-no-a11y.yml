@@ -1,0 +1,227 @@
+name: macOS (Qt without accessibility)
+
+# Builds Prism Launcher for Apple Silicon against a Qt 6.9.3 (the version used
+# by the official 11.1.1 macOS release) compiled with accessibility disabled,
+# working around crashes in Qt's Cocoa accessibility bridge:
+# https://github.com/PrismLauncher/PrismLauncher/issues/6117
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - "release-11.x"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build (macOS arm64, Qt without accessibility)
+
+    runs-on: macos-26
+    timeout-minutes: 300
+
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      ARTIFACT_NAME: macOS-arm64-NoA11y-Qt6
+      BUILD_PLATFORM: macOS-NoA11y
+      BUILD_TYPE: Release
+      CMAKE_PRESET: macos
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      QT_OSX_ARCHITECTURES: arm64
+      VERIFY_ARCH: arm64
+      OFFICIAL_RELEASE_URL: https://github.com/PrismLauncher/PrismLauncher/releases/download/11.1.1/PrismLauncher-macOS-11.1.1.zip
+
+    steps:
+      ##
+      # SETUP
+      ##
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up environment
+        run: |
+          {
+            echo "QT_PREFIX=$RUNNER_TEMP/qt-6.9.3-no-a11y"
+            echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT"
+            echo "VCPKG_BINARY_SOURCES=clear;files,$RUNNER_TEMP/vcpkg-binary-cache,readwrite"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/vcpkg-binary-cache"
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install ninja extra-cmake-modules temurin@17
+          echo "JAVA_HOME=$(/usr/libexec/java_home -v 17)" >> "$GITHUB_ENV"
+
+      - name: Restore Qt
+        id: qt-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/qt-6.9.3-no-a11y
+          key: qt-6.9.3-no-a11y-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/macos-build-qt-no-a11y.sh') }}
+
+      - name: Build Qt without accessibility
+        if: ${{ steps.qt-cache.outputs.cache-hit != 'true' }}
+        run: |
+          .github/scripts/macos-build-qt-no-a11y.sh "$QT_PREFIX"
+
+      # Saved right away so that a failure later in the job doesn't throw away
+      # the (slow) Qt build.
+      - name: Save Qt
+        if: ${{ steps.qt-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/qt-6.9.3-no-a11y
+          key: ${{ steps.qt-cache.outputs.cache-primary-key }}
+
+      - name: Check Qt configuration
+        run: |
+          cat "$QT_PREFIX/prism-qt-build-info.txt"
+          gui_config="$(find "$QT_PREFIX/lib/QtGui.framework" -name qtgui-config.h | head -n 1)"
+          grep -E 'QT_FEATURE_accessibility |QT_NO_ACCESSIBILITY ' "$gui_config"
+          grep -Eq '^#define QT_FEATURE_accessibility -1$' "$gui_config"
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/vcpkg-binary-cache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg-ports/**', 'cmake/vcpkg-triplets/**') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-
+
+      ##
+      # BUILD
+      ##
+
+      - name: Configure project
+        run: |
+          cmake --preset "$CMAKE_PRESET" \
+            -DCMAKE_PREFIX_PATH="$QT_PREFIX" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DVCPKG_TARGET_TRIPLET=arm64-osx
+
+      - name: Run build
+        run: |
+          cmake --build --preset "$CMAKE_PRESET" --config "$BUILD_TYPE"
+
+      - name: Run tests
+        run: |
+          ctest --preset "$CMAKE_PRESET" --build-config "$BUILD_TYPE"
+
+      ##
+      # PACKAGE
+      ##
+
+      - name: Get short version
+        id: short-version
+        run: |
+          echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Same steps as .github/actions/package/macos, without a signing certificate
+      - name: Package
+        run: |
+          cmake --install build --config "$BUILD_TYPE"
+
+          cd install
+          chmod +x "PrismLauncher.app/Contents/MacOS/prismlauncher"
+          sudo codesign --sign - --deep --force --entitlements ../program_info/AdhocSignedApp.entitlements --options runtime "PrismLauncher.app/Contents/MacOS/prismlauncher"
+          mv "PrismLauncher.app" "Prism Launcher.app"
+
+          ditto -c -k --sequesterRsrc --keepParent "Prism Launcher.app" ../PrismLauncher.zip
+
+          mkdir -p src
+          cp -R "Prism Launcher.app" src/
+          ln -s /Applications src/
+          hdiutil create \
+            -volname "Prism Launcher ${{ steps.short-version.outputs.version }}" \
+            -srcfolder src \
+            -ov -format ULMO \
+            ../PrismLauncher.dmg
+
+      ##
+      # VERIFY
+      ##
+
+      - name: Download official 11.1.1 build for comparison
+        continue-on-error: true
+        run: |
+          curl -fL --retry 3 -o "$RUNNER_TEMP/official.zip" "$OFFICIAL_RELEASE_URL"
+          mkdir -p "$RUNNER_TEMP/official"
+          ditto -x -k "$RUNNER_TEMP/official.zip" "$RUNNER_TEMP/official"
+          ls "$RUNNER_TEMP/official"
+
+      - name: Verify bundle
+        run: |
+          reference="$RUNNER_TEMP/official/Prism Launcher.app"
+          [ -d "$reference" ] || reference=""
+          .github/scripts/macos-verify-no-a11y.sh "install/Prism Launcher.app" "$reference" 2>&1 | tee "$RUNNER_TEMP/verify.txt"
+
+      - name: Smoke test
+        run: |
+          # Make sure the app cannot pick up the Qt it was built against.
+          mv "$QT_PREFIX" "$QT_PREFIX.hidden"
+          .github/scripts/macos-smoke-test.sh "install/Prism Launcher.app" 2>&1 | tee "$RUNNER_TEMP/smoke-test.txt"
+
+      - name: Smoke test official 11.1.1 build (reference)
+        continue-on-error: true
+        run: |
+          .github/scripts/macos-smoke-test.sh "$RUNNER_TEMP/official/Prism Launcher.app" 2>&1 | tee "$RUNNER_TEMP/smoke-test-official.txt"
+
+      - name: Write verification report
+        if: ${{ always() }}
+        run: |
+          report="$RUNNER_TEMP/verification-report.txt"
+          for part in verify smoke-test smoke-test-official; do
+            if [ -f "$RUNNER_TEMP/$part.txt" ]; then
+              {
+                echo "######## $part"
+                cat "$RUNNER_TEMP/$part.txt"
+                echo
+              } >> "$report"
+            fi
+          done
+          if [ -f "$report" ]; then
+            {
+              echo "### Verification report"
+              echo '```'
+              cat "$report"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      ##
+      # UPLOAD
+      ##
+
+      - name: Upload verification report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: verification-report-${{ steps.short-version.outputs.version }}
+          path: ${{ runner.temp }}/verification-report.txt
+          if-no-files-found: ignore
+
+      - name: Upload binary tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: PrismLauncher-macOS-arm64-NoA11y-${{ steps.short-version.outputs.version }}-${{ env.BUILD_TYPE }}
+          path: PrismLauncher.zip
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v7
+        with:
+          name: PrismLauncher-macOS-arm64-NoA11y-${{ steps.short-version.outputs.version }}-${{ env.BUILD_TYPE }}.dmg
+          path: PrismLauncher.dmg
