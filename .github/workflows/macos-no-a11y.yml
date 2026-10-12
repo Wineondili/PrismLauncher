@@ -113,9 +113,10 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DVCPKG_TARGET_TRIPLET=arm64-osx
 
+      # Keep going after errors so that a failing build reports all of them.
       - name: Run build
         run: |
-          cmake --build --preset "$CMAKE_PRESET" --config "$BUILD_TYPE"
+          cmake --build --preset "$CMAKE_PRESET" --config "$BUILD_TYPE" -- -k 0
 
       - name: Run tests
         run: |

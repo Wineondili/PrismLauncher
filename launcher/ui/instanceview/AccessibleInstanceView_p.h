@@ -2,9 +2,9 @@
 
 #include <QtGui/qaccessible.h>
 #include <QAbstractItemView>
-#include <QAccessibleWidget>
 #include "QtCore/qpointer.h"
 #ifndef QT_NO_ACCESSIBILITY
+#include <QAccessibleWidget>
 #include "InstanceView.h"
 // #include <QHeaderView>
 
