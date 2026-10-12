@@ -68,7 +68,7 @@ fi
 if kill -0 "$pid" 2> /dev/null; then
     echo
     echo "== Qt binaries loaded by the running process"
-    loaded="$(lsof -p "$pid" -Fn 2> /dev/null | sed -n 's/^n//p' | grep -E '/Qt[A-Za-z]*\.framework/|/PlugIns/|libq[a-z]*\.dylib' | sort -u)"
+    loaded="$(lsof -p "$pid" -Fn 2> /dev/null | sed -n 's/^n//p' | grep -E '/Qt[A-Za-z]*\.framework/|/libq[a-z0-9]*\.dylib$' | sort -u)"
     echo "$loaded" | sed 's/^/    /'
     outside="$(echo "$loaded" | grep -v "^$APP/" || true)"
     if [ -z "$loaded" ]; then
