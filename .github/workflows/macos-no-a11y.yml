@@ -71,7 +71,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/qt-6.9.3-no-a11y
-          key: qt-6.9.3-no-a11y-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/macos-build-qt-no-a11y.sh') }}
+          key: qt-6.9.3-no-a11y-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/macos-build-qt-no-a11y.sh', '.github/scripts/qt-patches/**') }}
 
       - name: Build Qt without accessibility
         if: ${{ steps.qt-cache.outputs.cache-hit != 'true' }}

@@ -10,7 +10,9 @@
 # https://github.com/PrismLauncher/PrismLauncher/issues/6117
 #
 # Apart from accessibility, Qt is configured with its defaults, matching the
-# official Qt binaries the launcher is normally built against. Homebrew
+# official Qt binaries the launcher is normally built against. Patches in
+# qt-patches/ (named <module>-*.patch) backport upstream fixes needed to build
+# with the current Xcode; they are applied after extracting the sources. Homebrew
 # prefixes are ignored so that every third-party library Qt needs comes from
 # Qt's bundled copies or the macOS SDK, keeping the result relocatable.
 #
@@ -35,6 +37,7 @@ PREFIX="$1"
 ARCHS="${QT_OSX_ARCHITECTURES:-arm64}"
 DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
 WORK_DIR="${QT_WORK_DIR:-${RUNNER_TEMP:-/tmp}/qt-no-a11y}"
+PATCH_DIR="$(cd "$(dirname "$0")" && pwd)/qt-patches"
 
 QT_MIRRORS="
 https://download.qt.io/archive/qt/6.9/${QT_VERSION}/submodules
@@ -72,6 +75,15 @@ prepare_openssl_headers() {
     cp -R "$brew_openssl/include" "$OPENSSL_HEADERS/"
 }
 
+apply_patches() {
+    local module="$1"
+    for patch_file in "$PATCH_DIR/$module"-*.patch; do
+        [ -f "$patch_file" ] || continue
+        echo "Applying $(basename "$patch_file")"
+        patch -d "$WORK_DIR/$module-everywhere-src-$QT_VERSION" -p1 --forward < "$patch_file"
+    done
+}
+
 download_module() {
     local module="$1"
     local tarball="$module-everywhere-src-$QT_VERSION.tar.xz"
@@ -84,6 +96,7 @@ download_module() {
             && echo "$expected  $WORK_DIR/$tarball" | shasum -a 256 -c -; then
             rm -rf "$WORK_DIR/$module-everywhere-src-$QT_VERSION"
             tar -xf "$WORK_DIR/$tarball" -C "$WORK_DIR"
+            apply_patches "$module"
             return 0
         fi
     done
@@ -114,7 +127,8 @@ build_qtbase() {
         -DOPENSSL_ROOT_DIR="$OPENSSL_HEADERS" \
         -DOPENSSL_INCLUDE_DIR="$OPENSSL_HEADERS/include"
 
-    cmake --build "$build" --parallel
+    # Keep going after errors so that a failing build reports all of them.
+    cmake --build "$build" --parallel -- -k 0
     cmake --install "$build"
 }
 
